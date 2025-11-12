@@ -296,3 +296,53 @@
   transform: translate(-50%,-50%);
   
 }
+
+/* Barra de Progresso e de Exibição do Conteudo de Reserva  */
+
+/* Barra de progresso em blocos */
+.steps-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 30px;
+}
+
+.progress-block {
+    width: 80px;
+    height: 6px;
+    background-color: #ddd;
+    border-radius: 10px;
+    transition: all 0.3s ease;
+}
+
+.progress-block.active {
+    background-color: #007bff;
+}
+
+/* Etapas */
+.etapa {
+    display: none;
+}
+
+.etapa.ativo {
+    display: block;
+}
+
+/* Classe para esconder mesas */
+.hide {
+    display: none !important;
+}
+
+
+/* agendamento */
+
+#horariosContainer button {
+    min-width: 100px;
+    margin: 5px;
+}
+
+#horariosContainer button.active {
+    background-color: #007bff;
+    color: white;
+}
