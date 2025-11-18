@@ -1,61 +1,172 @@
-name: Build -> ACR -> AKS
+name: Build → ACR → AKS (with App Service fallback)
 
 on:
   push:
     branches: [ "main" ]
-
-permissions:
-  contents: read
-  id-token: write
 
 env:
   IMAGE_NAME: restaurantefrances
 
 jobs:
   build-and-push:
+    name: Build image in ACR
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.image_tag }}
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to Azure (Service Principal)
+      - name: Set IMAGE_TAG
+        id: set-tag
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::8}
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Set variables
+      - name: Get ACR login server
+        id: acr-info
         run: |
-          echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
-          echo "RG=${{ secrets.AZ_RESOURCE_GROUP }}" >> $GITHUB_ENV
-          echo "AKS_NAME=${{ secrets.AKS_NAME }}" >> $GITHUB_ENV
-          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
-          echo "ACR_LOGIN_SERVER=${{ secrets.ACR_NAME }}.azurecr.io" >> $GITHUB_ENV
+          ACR_NAME="${{ secrets.ACR_NAME }}"
+          ACR_LOGIN=$(az acr show --name $ACR_NAME --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --query loginServer -o tsv)
+          echo "acr_login=${ACR_LOGIN}" >> $GITHUB_OUTPUT
+          echo "ACR_LOGIN=${ACR_LOGIN}" >> $GITHUB_ENV
 
-      - name: Build image in ACR
+      - name: Build & push image to ACR (using az acr build)
         run: |
-          az acr build --registry $ACR_NAME --image $IMAGE_NAME:${IMAGE_TAG} .
+          # uses ACR build (no docker local required)
+          az acr build --registry "${{ secrets.ACR_NAME }}" --image $IMAGE_NAME:${{ steps.set-tag.outputs.image_tag }} .
 
-  deploy-to-aks:
+  deploy-aks:
+    name: Deploy to AKS (attempt)
+    runs-on: ubuntu-latest
     needs: build-and-push
-    runs-on: ubuntu-latest
+    outputs:
+      aks_deployed: ${{ steps.set-result.outputs.aks_deployed }}
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Login to Azure (Service Principal)
+      - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
 
       - name: Get AKS credentials
+        id: get-creds
         run: |
-          az aks get-credentials --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name ${{ secrets.AKS_NAME }} --overwrite-existing
+          az aks get-credentials --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --name "${{ secrets.AKS_NAME }}" --overwrite-existing || true
 
-      - name: Update K8s deployment image
+      - name: Prepare variables
         run: |
-          kubectl set image deployment/restaurante-deployment restaurante=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --record
+          IMAGE_TAG=${{ needs.build-and-push.outputs.image-tag }}
+          ACR_LOGIN=$(az acr show --name "${{ secrets.ACR_NAME }}" --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --query loginServer -o tsv)
+          echo "IMAGE_FULL=${ACR_LOGIN}/${IMAGE_NAME}:${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "IMAGE_FULL"
 
-      - name: Verify rollout
+      - name: Apply K8s manifests (create/update)
+        id: apply-manifests
         run: |
-          kubectl rollout status deployment/restaurante-deployment --timeout=120s
-          kubectl get pods -l app=restaurante -o wide
+          set -o pipefail
+          IMAGE_FULL="${ACR_LOGIN}/${IMAGE_NAME}:${{ needs.build-and-push.outputs.image-tag }}"
+          # try to apply manifests (assumes k8s/ contains deployment.yaml and service)
+          if [ -d k8s ]; then
+            # replace placeholder image in deployment (if you store placeholder)
+            kubectl apply -f k8s/ || { echo "kubectl apply failed"; exit 1; }
+            # try to update image in case deployment exists
+            kubectl set image deployment/restaurante-deployment restaurante=${IMAGE_FULL} --record || echo "set image returned non-zero"
+          else
+            echo "No k8s/ directory found; skipping k8s apply"
+            exit 1
+          fi
+
+      - name: Wait for deployment to become ready (with timeout)
+        run: |
+          DEPLOY_NAME=restaurante-deployment
+          NAMESPACE=default
+          # wait up to 120s for rollout
+          kubectl rollout status deployment/$DEPLOY_NAME --timeout=120s
+        continue-on-error: true
+
+      - name: Check deployment status and set output
+        id: set-result
+        run: |
+          DEPLOY_NAME=restaurante-deployment
+          # check if deployment has available replicas
+          AVAILABLE=$(kubectl get deploy $DEPLOY_NAME -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
+          if [ "$AVAILABLE" != "" ] && [ "$AVAILABLE" -ge "1" ]; then
+            echo "aks_deployed=true" >> $GITHUB_OUTPUT
+            echo "AKS deployment OK (available replicas: $AVAILABLE)"
+          else
+            echo "aks_deployed=false" >> $GITHUB_OUTPUT
+            echo "AKS deployment failed or not ready (available replicas: $AVAILABLE)"
+          fi
+
+  deploy-appservice-fallback:
+    name: Fallback: Deploy to Azure Web App for Containers
+    runs-on: ubuntu-latest
+    needs: deploy-aks
+    if: needs.deploy-aks.outputs.aks_deployed == 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get ACR login server and credentials
+        id: acr-creds
+        run: |
+          ACR_NAME="${{ secrets.ACR_NAME }}"
+          ACR_LOGIN=$(az acr show --name $ACR_NAME --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --query loginServer -o tsv)
+          ACR_USER=$(az acr credential show --name $ACR_NAME --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --query username -o tsv)
+          ACR_PWD=$(az acr credential show --name $ACR_NAME --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --query "passwords[0].value" -o tsv)
+          echo "ACR_LOGIN=${ACR_LOGIN}" >> $GITHUB_ENV
+          echo "ACR_USER=${ACR_USER}" >> $GITHUB_ENV
+          echo "ACR_PWD=${ACR_PWD}" >> $GITHUB_ENV
+
+      - name: Build image tag variable
+        run: |
+          IMAGE_TAG=${{ needs.build-and-push.outputs.image-tag }}
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "IMAGE_FULL=${ACR_LOGIN}/${IMAGE_NAME}:${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Create App Service Plan (if not exists)
+        run: |
+          az appservice plan create --name "${{ secrets.APP_SERVICE_PLAN }}" --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --sku B1 --is-linux || echo "App Service Plan may already exist"
+
+      - name: Create or update Web App with container image
+        run: |
+          WEBAPP="${{ secrets.WEBAPP_NAME }}"
+          RG="${{ secrets.AZ_RESOURCE_GROUP }}"
+          IMAGE="${ACR_LOGIN}/${IMAGE_NAME}:${IMAGE_TAG}"
+          # Create webapp if not exists
+          az webapp show --name $WEBAPP --resource-group $RG >/dev/null 2>&1 || \
+            az webapp create --name $WEBAPP --plan "${{ secrets.APP_SERVICE_PLAN }}" --resource-group $RG --deployment-container-image-name $IMAGE
+          # Configure container registry credentials (private ACR)
+          az webapp config container set --name $WEBAPP --resource-group $RG \
+            --docker-custom-image-name $IMAGE \
+            --docker-registry-server-url "https://${ACR_LOGIN}" \
+            --docker-registry-server-user "${ACR_USER}" \
+            --docker-registry-server-password "${ACR_PWD}"
+
+      - name: Restart Web App to pick up new image
+        run: |
+          az webapp restart --name "${{ secrets.WEBAPP_NAME }}" --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}"
+
+      - name: Output fallback URL
+        run: |
+          echo "Web App URL:"
+          az webapp show --name "${{ secrets.WEBAPP_NAME }}" --resource-group "${{ secrets.AZ_RESOURCE_GROUP }}" --query defaultHostName -o tsv
