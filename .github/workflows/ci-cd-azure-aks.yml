@@ -1,0 +1,77 @@
+name: Build and Deploy to Azure AKS
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login no Azure via OIDC (mais seguro)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build da imagem direto no ACR
+        run: |
+          echo "⏳ Iniciando build da imagem no ACR..."
+          az acr build \
+            --registry ${{ secrets.ACR_NAME }} \
+            --image restaurantefrances:${{ github.sha }} \
+            .
+
+      - name: Definir tag da imagem
+        run: echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Login novamente no Azure
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Obter credenciais do AKS
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_NAME }} \
+            --overwrite-existing
+
+      - name: Atualizar imagem do Deployment no AKS
+        run: |
+          ACR_LOGIN="${{ secrets.ACR_NAME }}.azurecr.io"
+          echo "Atualizando imagem no Deployment..."
+          kubectl set image deployment/restaurante-deployment \
+            restaurante=$ACR_LOGIN/restaurantefrances:${{ env.IMAGE_TAG }} --record \
+            || echo "Deployment não existe ainda."
+
+      - name: Aplicar manifests (deploy e service)
+        run: |
+          echo "Aplicando arquivos Kubernetes..."
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service-lb.yaml
+
+      - name: Verificar status dos pods
+        run: |
+          echo "Status dos pods:"
+          kubectl get pods -o wide
