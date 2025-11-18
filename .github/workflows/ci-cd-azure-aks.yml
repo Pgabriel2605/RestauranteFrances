@@ -1,77 +1,61 @@
-name: Build and Deploy to Azure AKS
+name: Build -> ACR -> AKS
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
 
 permissions:
-  id-token: write
   contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: restaurantefrances
 
 jobs:
-
   build-and-push:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout código
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Login no Azure via OIDC (mais seguro)
+      - name: Login to Azure (Service Principal)
         uses: azure/login@v2
         with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Build da imagem direto no ACR
+      - name: Set variables
         run: |
-          echo "⏳ Iniciando build da imagem no ACR..."
-          az acr build \
-            --registry ${{ secrets.ACR_NAME }} \
-            --image restaurantefrances:${{ github.sha }} \
-            .
+          echo "ACR_NAME=${{ secrets.ACR_NAME }}" >> $GITHUB_ENV
+          echo "RG=${{ secrets.AZ_RESOURCE_GROUP }}" >> $GITHUB_ENV
+          echo "AKS_NAME=${{ secrets.AKS_NAME }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+          echo "ACR_LOGIN_SERVER=${{ secrets.ACR_NAME }}.azurecr.io" >> $GITHUB_ENV
 
-      - name: Definir tag da imagem
-        run: echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+      - name: Build image in ACR
+        run: |
+          az acr build --registry $ACR_NAME --image $IMAGE_NAME:${IMAGE_TAG} .
 
-
-  deploy:
+  deploy-to-aks:
     needs: build-and-push
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout código
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Login novamente no Azure
+      - name: Login to Azure (Service Principal)
         uses: azure/login@v2
         with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Obter credenciais do AKS
+      - name: Get AKS credentials
         run: |
-          az aks get-credentials \
-            --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
-            --name ${{ secrets.AKS_NAME }} \
-            --overwrite-existing
+          az aks get-credentials --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name ${{ secrets.AKS_NAME }} --overwrite-existing
 
-      - name: Atualizar imagem do Deployment no AKS
+      - name: Update K8s deployment image
         run: |
-          ACR_LOGIN="${{ secrets.ACR_NAME }}.azurecr.io"
-          echo "Atualizando imagem no Deployment..."
-          kubectl set image deployment/restaurante-deployment \
-            restaurante=$ACR_LOGIN/restaurantefrances:${{ env.IMAGE_TAG }} --record \
-            || echo "Deployment não existe ainda."
+          kubectl set image deployment/restaurante-deployment restaurante=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} --record
 
-      - name: Aplicar manifests (deploy e service)
+      - name: Verify rollout
         run: |
-          echo "Aplicando arquivos Kubernetes..."
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service-lb.yaml
-
-      - name: Verificar status dos pods
-        run: |
-          echo "Status dos pods:"
-          kubectl get pods -o wide
+          kubectl rollout status deployment/restaurante-deployment --timeout=120s
+          kubectl get pods -l app=restaurante -o wide
