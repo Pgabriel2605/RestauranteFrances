@@ -1,12 +1,12 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: restaurante-lb
+  name: restaurante-frances-svc
 spec:
-  selector:
-    app: restaurante
   type: LoadBalancer
+  selector:
+    app: restaurante-frances
   ports:
-    - name: http
+    - protocol: TCP
       port: 80
-      targetPort: 3000
+      targetPort: 80
