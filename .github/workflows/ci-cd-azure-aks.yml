@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
 
 env:
-  IMAGE_NAME: thezyon/restaurantefrances  # ← SEU USUÁRIO AQUI!
+  IMAGE_NAME: thezyon/restaurante-frances  # ← SEU USUÁRIO AQUI!
 
 jobs:
   build_and_push:
